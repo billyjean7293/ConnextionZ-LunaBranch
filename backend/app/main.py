@@ -28,7 +28,7 @@ from slowapi.util import get_remote_address
 from backend.app.auth import delete_user_account, get_user_profile, AuthContext
 from backend.app.auth_routes import create_auth_router
 from backend.app.database import get_session, run_migrations
-from backend.app.models import Follow, Media as DbMedia, Notification, Playlist as DbPlaylist, Post as DbPost, PostLike, Profile as DbProfile, Sound as DbSound, User
+from backend.app.models import Follow, Media as DbMedia, Notification, NotificationPreference, Playlist as DbPlaylist, Post as DbPost, PostLike, Profile as DbProfile, Sound as DbSound, User
 from backend.app.media import AVATAR_TYPES, MAX_AVATAR_BYTES, MAX_MEDIA_BYTES, MEDIA_ROOT, MEDIA_TYPES, store_upload
 from backend.app.media_routes import create_media_router
 from backend.app.profile_validation import (
@@ -39,9 +39,10 @@ from backend.app.profile_validation import (
     validate_website,
 )
 from backend.app.graphql_types import (
-    ContentItem, FeedItem, FeedPage, FollowResult, HashtagResult, LikeResult, NotificationItem, Playlist,
-    PlaylistInput, PostInput, PostPage, Profile, ProfilePage, ProfileSummary, SoundResult,
-    UpdatePlaylistInput, UpdatePostInput, UpdateProfileInput,
+    ContentItem, FeedItem, FeedPage, FollowResult, HashtagResult, LikeResult, NotificationItem,
+    NotificationPreferences, Playlist, PlaylistInput, PostInput, PostPage, Profile, ProfilePage,
+    ProfileSummary, SoundResult, UpdateNotificationPreferencesInput, UpdatePlaylistInput,
+    UpdatePostInput, UpdateProfileInput,
 )
 from backend.app.seed import seed_database
 logging.basicConfig(
@@ -341,7 +342,12 @@ class Query:
         return profile_to_graphql(profile)
 
     @strawberry.field
-    def notifications(self, info: Info) -> list[NotificationItem]:
+    def notifications(
+    self,
+    info: Info,
+    limit: int = 20,
+    offset: int = 0,
+) -> list[NotificationItem]:
         """
         Return notifications for the currently logged-in user,
         ordered from newest to oldest.
@@ -361,6 +367,8 @@ class Query:
                 select(Notification)
                 .where(Notification.recipient_id == user_id)
                 .order_by(Notification.created_at.desc())
+                .limit(limit)
+                .offset(offset)
             ).scalars().all()
 
             results: list[NotificationItem] = []
@@ -402,6 +410,68 @@ class Query:
                 )
 
             return results
+
+    @strawberry.field(name="unreadNotificationCount")
+    def unread_notification_count(self, info: Info) -> int:
+        """Return the number of unread notifications for the current user."""
+
+        user_id = info.context.get("user_id")
+
+        if user_id is None:
+            raise api_error(
+                "Must be logged in to view notifications",
+                "UNAUTHENTICATED",
+                401,
+            )
+
+        with get_session() as session:
+            count = session.execute(
+                select(func.count(Notification.id)).where(
+                    Notification.recipient_id == user_id,
+                    Notification.read.is_(False),
+                )
+            ).scalar_one()
+
+            return int(count or 0)
+
+    @strawberry.field(name="notificationPreferences")
+    def notification_preferences(self, info: Info) -> NotificationPreferences:
+        """Return notification preferences for the current user."""
+
+        user_id = info.context.get("user_id")
+
+        if user_id is None:
+            raise api_error(
+                "Must be logged in to view notification preferences",
+                "UNAUTHENTICATED",
+                401,
+            )
+
+        with get_session() as session:
+            preferences = session.execute(
+                select(NotificationPreference).where(
+                    NotificationPreference.user_id == user_id
+                )
+            ).scalar_one_or_none()
+
+            if preferences is None:
+                preferences = NotificationPreference(user_id=user_id)
+                session.add(preferences)
+                session.commit()
+                session.refresh(preferences)
+
+            return NotificationPreferences(
+                collab_requests=preferences.collab_requests,
+                messages=preferences.messages,
+                likes=preferences.likes,
+                comments=preferences.comments,
+                new_followers=preferences.new_followers,
+                live_alerts=preferences.live_alerts,
+                trending_sounds=preferences.trending_sounds,
+                product_updates=preferences.product_updates,
+                email_digest=preferences.email_digest,
+                quiet_hours=preferences.quiet_hours,
+            )
     
     @strawberry.field
     def profile(self, username: str, info: Info) -> Profile | None:
@@ -904,16 +974,29 @@ class Mutation:
                     # another user's post. Users should not receive
                     # notifications for liking their own posts.
                     if post_owner is not None and post_owner.user_id != user_id:
-                        session.add(
-                            Notification(
-                                recipient_id=post_owner.user_id,
-                                actor_id=user_id,
-                                type="like",
-                                post_id=post_id,
-                                text="liked your post",
-                                read=False,
+                        preferences = session.execute(
+                            select(NotificationPreference).where(
+                                NotificationPreference.user_id == post_owner.user_id
                             )
+                        ).scalar_one_or_none()
+
+                        likes_enabled = (
+                            preferences.likes
+                            if preferences is not None
+                            else True
                         )
+
+                        if likes_enabled:
+                            session.add(
+                                Notification(
+                                    recipient_id=post_owner.user_id,
+                                    actor_id=user_id,
+                                    type="like",
+                                    post_id=post_id,
+                                    text="liked your post",
+                                    read=False,
+                                )
+                            )
 
                 session.commit()
 
@@ -1018,6 +1101,79 @@ class Mutation:
 
             return True
 
+    @strawberry.mutation(name="updateNotificationPreferences")
+    def update_notification_preferences(
+        self,
+        input: UpdateNotificationPreferencesInput,
+        info: Info,
+    ) -> NotificationPreferences:
+        """Update notification preferences for the current user."""
+
+        user_id = info.context.get("user_id")
+
+        if user_id is None:
+            raise api_error(
+                "Must be logged in to update notification preferences",
+                "UNAUTHENTICATED",
+                401,
+            )
+
+        if (
+            input.email_digest is not None
+            and input.email_digest not in {"off", "daily", "weekly"}
+        ):
+            raise api_error(
+                "emailDigest must be one of: off, daily, weekly",
+                "VALIDATION_ERROR",
+                400,
+            )
+
+        with get_session() as session:
+            preferences = session.execute(
+                select(NotificationPreference).where(
+                    NotificationPreference.user_id == user_id
+                )
+            ).scalar_one_or_none()
+
+            if preferences is None:
+                preferences = NotificationPreference(user_id=user_id)
+                session.add(preferences)
+            if input.collab_requests is not None:
+                preferences.collab_requests = input.collab_requests
+            if input.messages is not None:
+                preferences.messages = input.messages
+            if input.likes is not None:
+                preferences.likes = input.likes
+            if input.comments is not None:
+                preferences.comments = input.comments
+            if input.new_followers is not None:
+                preferences.new_followers = input.new_followers
+            if input.live_alerts is not None:
+                preferences.live_alerts = input.live_alerts
+            if input.trending_sounds is not None:
+                preferences.trending_sounds = input.trending_sounds
+            if input.product_updates is not None:
+                preferences.product_updates = input.product_updates
+            if input.email_digest is not None:
+                preferences.email_digest = input.email_digest
+            if input.quiet_hours is not None:
+                preferences.quiet_hours = input.quiet_hours
+            session.commit()
+            session.refresh(preferences)
+
+            return NotificationPreferences(
+                collab_requests=preferences.collab_requests,
+                messages=preferences.messages,
+                likes=preferences.likes,
+                comments=preferences.comments,
+                new_followers=preferences.new_followers,
+                live_alerts=preferences.live_alerts,
+                trending_sounds=preferences.trending_sounds,
+                product_updates=preferences.product_updates,
+                email_digest=preferences.email_digest,
+                quiet_hours=preferences.quiet_hours,
+            )
+
     @strawberry.mutation
     def follow(self, username: str, info: Info) -> FollowResult:
         with get_session() as session:
@@ -1043,17 +1199,30 @@ class Mutation:
                 follower.following += 1
                 target.followers += 1
 
-                # Create a notification for the user being followed.
-                session.add(
-                    Notification(
-                        recipient_id=target.user_id,
-                        actor_id=follower.user_id,
-                        type="follow",
-                        post_id=None,
-                        text="started following you",
-                        read=False,
+                # Check whether the target user wants new-follower notifications.
+                preferences = session.execute(
+                    select(NotificationPreference).where(
+                        NotificationPreference.user_id == target.user_id
                     )
+                ).scalar_one_or_none()
+
+                new_followers_enabled = (
+                    preferences.new_followers
+                    if preferences is not None
+                    else False
                 )
+
+                if new_followers_enabled:
+                    session.add(
+                        Notification(
+                            recipient_id=target.user_id,
+                            actor_id=follower.user_id,
+                            type="follow",
+                            post_id=None,
+                            text="started following you",
+                            read=False,
+                        )
+                    )
 
                 try:
                     session.commit()

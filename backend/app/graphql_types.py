@@ -161,7 +161,34 @@ class SoundResult:
     growth_pct: int = strawberry.field(name="growthPct")
     duration: str
     bpm: int
+@strawberry.type
 
+
+class NotificationPreferences:
+    collab_requests: bool = strawberry.field(name="collabRequests")
+    messages: bool
+    likes: bool
+    comments: bool
+    new_followers: bool = strawberry.field(name="newFollowers")
+    live_alerts: bool = strawberry.field(name="liveAlerts")
+    trending_sounds: bool = strawberry.field(name="trendingSounds")
+    product_updates: bool = strawberry.field(name="productUpdates")
+    email_digest: str = strawberry.field(name="emailDigest")
+    quiet_hours: bool = strawberry.field(name="quietHours")
+
+
+@strawberry.input
+class UpdateNotificationPreferencesInput:
+    collab_requests: bool | None = strawberry.field(name="collabRequests", default=None)
+    messages: bool | None = None
+    likes: bool | None = None
+    comments: bool | None = None
+    new_followers: bool | None = strawberry.field(name="newFollowers", default=None)
+    live_alerts: bool | None = strawberry.field(name="liveAlerts", default=None)
+    trending_sounds: bool | None = strawberry.field(name="trendingSounds", default=None)
+    product_updates: bool | None = strawberry.field(name="productUpdates", default=None)
+    email_digest: str | None = strawberry.field(name="emailDigest", default=None)
+    quiet_hours: bool | None = strawberry.field(name="quietHours", default=None)
 
 @strawberry.input
 class PostInput:
